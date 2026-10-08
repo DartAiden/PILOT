@@ -33,6 +33,7 @@ dependencies:
   - pip:
       - ase
       - lmdb
+      - mkl=2024.0
       - nglview
       - rmsd
       - torch_ema

@@ -64,7 +64,7 @@ use_centroid_context_embed: false
 
 #DATA
 dataset: crossdocked
-dataset_root: /scratch1/cremej01/data/crossdocked_noH_cutoff5_new
+dataset_root: /content/crossdocked_processed"
 dataset_cutoff: 5
 
 # DIFFUSION
