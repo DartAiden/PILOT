@@ -111,7 +111,7 @@ def process_ligand_and_pocket(
                             np.eye(
                                 1,
                                 len(amino_acid_dict),
-                                amino_acid_dict[three_to_one.get(res.get_resname())],
+                                amino_acid_dict[three_to_one.get(res.get_resname().strip().capitalize())],
                             ).squeeze()
                         )
                         full_coords.append(atom.coord)
@@ -141,7 +141,7 @@ def process_ligand_and_pocket(
                         np.eye(
                             1,
                             len(amino_acid_dict),
-                            amino_acid_dict[three_to_one.get(res.get_resname())],
+                            amino_acid_dict[three_to_one.get(res.get_resname().strip().capitalize())],
                         ).squeeze()
                     )
                     m = True
