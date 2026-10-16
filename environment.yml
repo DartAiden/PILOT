@@ -16,6 +16,7 @@ dependencies:
   - pyg::pytorch-scatter
   - pyg::pytorch-sparse
   - pyg::pytorch-cluster
+  - conda-forge::biopython=1.81
   - conda-forge::rdkit=2023.9.3
   - conda-forge::pytorch-lightning=2.0.6
   - conda-forge::jupyter
@@ -34,7 +35,6 @@ dependencies:
   - conda-forge::biopython=1.81
   - pip:
       - ase
-      - biopython==1.81
       - lmdb
       - nglview
       - rmsd
