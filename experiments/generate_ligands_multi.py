@@ -11,7 +11,7 @@ from time import time
 
 import numpy as np
 import torch
-from Bio.PDB import PDBParser
+from Bio.PDB import PDBParser, is_aa
 from rdkit import Chem
 from torch_geometric.data import Batch
 
@@ -46,6 +46,61 @@ class dotdict(dict):
 
 def create_list_defaultdict():
     return defaultdict(list)
+
+
+def ensure_pocket_txt(pdb_file, sdf_file, txt_file, cutoff):
+    """Create missing chain:residue IDs using PILOT's minimum-distance rule.
+
+    Coordinates must already share a reference frame. Existing pocket files
+    remain authoritative; the cutoff only applies when creating a new file.
+    """
+    txt_file = Path(txt_file)
+    if txt_file.exists():
+        return
+    if not np.isfinite(cutoff) or cutoff <= 0:
+        raise ValueError("Pocket cutoff must be a positive finite distance in Angstrom.")
+    ligand = next(iter(Chem.SDMolSupplier(str(sdf_file), sanitize=False,
+                                           removeHs=False)), None)
+    if ligand is None or ligand.GetNumConformers() == 0:
+        raise ValueError(f"Cannot read reference ligand coordinates from {sdf_file}")
+    heavy_atoms = [a.GetIdx() for a in ligand.GetAtoms() if a.GetAtomicNum() > 1]
+    if not heavy_atoms:
+        raise ValueError(f"Reference ligand has no heavy atoms: {sdf_file}")
+    lig_coords = ligand.GetConformer().GetPositions()[heavy_atoms]
+    model = PDBParser(QUIET=True).get_structure("", str(pdb_file))[0]
+    pocket_ids = []
+    for residue in model.get_residues():
+        if not is_aa(residue.get_resname(), standard=True):
+            continue
+        coords = np.asarray([atom.get_coord() for atom in residue.get_atoms()])
+        if not len(coords):
+            continue
+        distances_sq = ((coords[:, None, :] - lig_coords[None, :, :]) ** 2).sum(-1)
+        if distances_sq.min() < cutoff ** 2:
+            # The downstream reader supports only ordinary integer residue IDs.
+            if residue.id[0] != " " or residue.id[2] != " " or not residue.parent.id.strip():
+                raise ValueError(
+                    f"Cannot encode pocket residue {residue.full_id} in chain:integer "
+                    "format. Normalize chain IDs and residue numbering first."
+                )
+            pocket_ids.append(f"{residue.parent.id}:{residue.id[1]}")
+    if not pocket_ids:
+        raise ValueError(
+            f"No standard protein residues within {cutoff} Angstrom of {sdf_file}. "
+            "Check that the protein and ligand use the same coordinate frame."
+        )
+    # Atomic replacement prevents readers from seeing a partially written file.
+    with tempfile.NamedTemporaryFile(mode="w", dir=txt_file.parent,
+                                     prefix=txt_file.name + ".", delete=False) as handle:
+        temporary_path = Path(handle.name)
+        try:
+            handle.write(" ".join(pocket_ids) + "\n")
+            handle.close()
+            os.replace(temporary_path, txt_file)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+    print(f"Created {txt_file}: {len(pocket_ids)} pocket residues (cutoff {cutoff} A)")
 
 
 def evaluate(args):
@@ -226,9 +281,11 @@ def evaluate(args):
             pdb_file = Path(sdf_file.parent, f"{pdb_name}.pdb")
 
         txt_file = Path(sdf_file.parent, f"{ligand_name}.txt")
+        ensure_pocket_txt(pdb_file, sdf_file, txt_file, args.pocket_cutoff)
         if args.test_dir_10A is not None:
             pdb_file_10A = Path(args.test_dir_10A, f"{pdb_name}.pdb")
             txt_file_10A = Path(args.test_dir_10A, f"{ligand_name}.txt")
+            ensure_pocket_txt(pdb_file_10A, sdf_file, txt_file_10A, 10.0)
             with open(txt_file_10A, "r") as f:
                 resi_list_10A = f.read().split()
             pdb_struct_10A = PDBParser(QUIET=True).get_structure("", pdb_file_10A)[0]
@@ -248,9 +305,8 @@ def evaluate(args):
         with open(txt_file, "r") as f:
             resi_list = f.read().split()
 
-        assert (
-            resi_list is not None
-        ), "Pre-process pdb files extracting residues in specified cutoff and save as txt!"
+        if not resi_list:
+            raise ValueError(f"Pocket residue file is empty: {txt_file}")
 
         pdb_struct = PDBParser(QUIET=True).get_structure("", pdb_file)[0]
 
@@ -644,6 +700,8 @@ def get_args():
     parser.add_argument("--build-obabel-mol", default=False, action="store_true")
     parser.add_argument('--batch-size', default=100, type=int)
     parser.add_argument('--dist-cutoff', default=5.0, type=float)
+    parser.add_argument('--pocket-cutoff', default=7.0, type=float,
+                        help='Distance cutoff in Angstrom for creating missing pocket .txt files. Existing files are reused. Default: 7 (CrossDocked preprocessing); use 5 for Kinodata.')
     parser.add_argument('--ddim', default=False, action="store_true",
                         help='If DDIM sampling should be used. Defaults to False')
     parser.add_argument('--eta-ddim', default=1.0, type=float,
