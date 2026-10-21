@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import pickle
 import random
 import tempfile
 import warnings
@@ -46,6 +47,54 @@ class dotdict(dict):
 
 def create_list_defaultdict():
     return defaultdict(list)
+
+
+def load_or_create_sampling_metadata(metadata_file, config, build_metadata):
+    """Cache training-derived inference metadata, never estimates from a test ligand."""
+    metadata_file = Path(metadata_file)
+    required = {"dataset_info", "histogram", "test_smiles", "prop_norm", "prop_dist"}
+    if metadata_file.exists():
+        with metadata_file.open("rb") as handle:
+            cached = pickle.load(handle)
+        if cached.get("version") != 1 or cached.get("config") != config:
+            raise ValueError(
+                f"Incompatible sampling metadata: {metadata_file}. "
+                "Choose a different --metadata-file for this model configuration."
+            )
+        if not required.issubset(cached.get("metadata", {})):
+            raise ValueError(f"Incomplete sampling metadata: {metadata_file}")
+        print(f"Loading sampling metadata from {metadata_file}")
+        return cached["metadata"]
+
+    print(f"Creating {metadata_file} from the dataset at --dataset-root...")
+    try:
+        metadata = build_metadata()
+    except (FileNotFoundError, ValueError) as error:
+        raise RuntimeError(
+            f"Cannot create {metadata_file}: the original training dataset or its "
+            "required statistics could not be loaded. Set --dataset-root to the "
+            "actual preprocessed training dataset (including raw/train.npz, "
+            "raw/val.npz, raw/test.npz and size_distribution.npy), or create this "
+            "cache on the training machine and copy it here using --metadata-file. "
+            "Training statistics cannot be reconstructed from a single test "
+            f"protein/ligand pair. Original error: {error}"
+        ) from error
+    if not required.issubset(metadata):
+        raise ValueError("Metadata builder returned incomplete sampling metadata")
+    metadata_file.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="wb", dir=metadata_file.parent,
+                                     prefix=metadata_file.name + ".", delete=False) as handle:
+        temporary_path = Path(handle.name)
+        try:
+            pickle.dump({"version": 1, "config": config, "metadata": metadata},
+                        handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.close()
+            os.replace(temporary_path, metadata_file)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+    print(f"Saved sampling metadata to {metadata_file}")
+    return metadata
 
 
 def ensure_pocket_txt(pdb_file, sdf_file, txt_file, cutoff):
@@ -164,31 +213,58 @@ def evaluate(args):
     else:
         raise Exception("Dataset not available!")
 
-    datamodule = DataModule(hparams)
-
-    from experiments.data.data_info import GeneralInfos as DataInfos
-
-    dataset_info = DataInfos(datamodule, hparams)
-    histogram = os.path.join(hparams.dataset_root, "size_distribution.npy")
-    histogram = np.load(histogram).tolist()
-    test_smiles = list(datamodule.test_dataset.smiles)
-
-    prop_norm, prop_dist = None, None
-    if (
-        len(hparams.properties_list) > 0
-        and hparams.context_mapping
-        and not hparams.use_centroid_context_embed
-    ) or (
-        hparams.property_training
-        and not (
-            hparams.regression_property == "sa_score"
-            or hparams.regression_property == "docking_score"
-            or hparams.regression_property == "ic50"
+    metadata_file = args.metadata_file
+    if metadata_file is None:
+        metadata_file = Path(hparams.dataset_root) / "sampling_metadata.pickle"
+    metadata_config = {
+        key: hparams.get(key)
+        for key in (
+            "dataset", "remove_hs", "num_bond_classes", "num_charge_classes",
+            "properties_list", "context_mapping", "use_centroid_context_embed",
+            "property_training", "regression_property", "joint_property_prediction",
+            "additional_feats",
         )
-    ):
-        prop_norm = datamodule.compute_mean_mad(hparams.properties_list)
-        prop_dist = DistributionProperty(datamodule, hparams.properties_list)
-        prop_dist.set_normalizer(prop_norm)
+    }
+
+    def build_metadata():
+        datamodule = DataModule(hparams)
+
+        from experiments.data.data_info import GeneralInfos as DataInfos
+
+        dataset_info = DataInfos(datamodule, hparams)
+        histogram = os.path.join(hparams.dataset_root, "size_distribution.npy")
+        histogram = np.load(histogram).tolist()
+        test_smiles = list(datamodule.test_dataset.smiles)
+
+        prop_norm, prop_dist = None, None
+        if (
+            len(hparams.properties_list) > 0
+            and hparams.context_mapping
+            and not hparams.use_centroid_context_embed
+        ) or (
+            hparams.property_training
+            and not (
+                hparams.regression_property == "sa_score"
+                or hparams.regression_property == "docking_score"
+                or hparams.regression_property == "ic50"
+            )
+        ):
+            prop_norm = datamodule.compute_mean_mad(hparams.properties_list)
+            prop_dist = DistributionProperty(datamodule, hparams.properties_list)
+            prop_dist.set_normalizer(prop_norm)
+        return dict(dataset_info=dataset_info, histogram=histogram,
+                    test_smiles=test_smiles, prop_norm=prop_norm, prop_dist=prop_dist)
+
+    metadata = load_or_create_sampling_metadata(
+        metadata_file, metadata_config, build_metadata
+    )
+    if args.metadata_only:
+        return
+    dataset_info = metadata["dataset_info"]
+    histogram = metadata["histogram"]
+    test_smiles = metadata["test_smiles"]
+    prop_norm = metadata["prop_norm"]
+    prop_dist = metadata["prop_dist"]
 
     if hparams.additional_feats:
         from experiments.deprecated.diffusion_discrete_pocket_addfeats import Trainer
@@ -687,6 +763,10 @@ def get_args():
     parser.add_argument('--model-path', default="/hpfs/userws/cremej01/workspace/logs/aqm_qm7x/x0_t_weighting_dip_mpol/best_mol_stab.ckpt", type=str,
                         help='Path to trained model')
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--metadata-file", type=Path, default=None,
+                        help="Portable sampling metadata pickle. Loaded if present; otherwise created from --dataset-root. Defaults to DATASET_ROOT/sampling_metadata.pickle.")
+    parser.add_argument("--metadata-only", action="store_true",
+                        help="Create or validate sampling metadata and exit before loading the model or sampling.")
     parser.add_argument('--dataset-root', default=None, type=str,
                         help='If not set it will be taken from the model ckpt, otherwise it will overwrite it in the ckpt.')
     parser.add_argument('--save-xyz', default=False, action="store_true",
