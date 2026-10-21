@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from time import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -47,6 +48,114 @@ class dotdict(dict):
 
 def create_list_defaultdict():
     return defaultdict(list)
+
+
+class UnavailableSizeDistribution:
+    """Fail loudly if dataset-free sampling attempts to use a missing prior."""
+
+    def sample(self, *args, **kwargs):
+        raise RuntimeError("No training size distribution: use the reference ligand size.")
+
+    sample_conditional = sample
+
+
+def checkpoint_dataset_info(checkpoint, hparams):
+    """Recover only model inputs actually present in a CrossDocked checkpoint."""
+    from experiments.data.data_info import GeneralInfos, full_atom_encoder
+
+    if hparams.get("dataset") != "crossdocked":
+        raise ValueError("--dataset-free currently supports CrossDocked checkpoints only")
+    unsupported = [key for key in (
+        "additional_feats", "use_latent_encoder", "use_centroid_context_embed",
+        "use_scaffold_latent_embed", "context_mapping", "property_training",
+        "bond_model_guidance",
+    ) if hparams.get(key)]
+    if unsupported:
+        raise ValueError("Dataset-free mode cannot recover metadata for: " + ", ".join(unsupported))
+    state = checkpoint["state_dict"]
+    priors = {}
+    for name, size in (("atoms_prior", 16), ("bonds_prior", 5), ("charges_prior", 6)):
+        value = state.get(name)
+        if value is None or tuple(value.shape) != (size,):
+            raise ValueError(f"Expected checkpoint buffer {name} with shape ({size},)")
+        value = value.detach().cpu().float().clone()
+        if not torch.isfinite(value).all() or (value < 0).any() or not torch.isclose(
+            value.sum(), torch.tensor(1.0), atol=1e-4
+        ):
+            raise ValueError(f"Invalid probability distribution in {name}")
+        priors[name] = value
+    if hparams.get("num_bond_classes", 5) != 5:
+        raise ValueError("Dataset-free mode expects five bond classes")
+    if hparams.get("num_atom_types", 16) != 16:
+        raise ValueError("Checkpoint atom classes do not match the CrossDocked encoder")
+
+    # Reuse the repository's encoding methods without invoking training statistics.
+    info = GeneralInfos.__new__(GeneralInfos)
+    info.name = "crossdocked_checkpoint"
+    info.remove_h = hparams.get("remove_hs", True)
+    info.need_to_strip = False
+    info.atom_encoder = dict(full_atom_encoder)
+    info.atom_decoder = list(full_atom_encoder)
+    info.num_atom_types = 16
+    info.num_bond_classes = 5
+    info.num_charge_classes = 6
+    info.charge_offset = 2
+    info.collapse_charges = torch.tensor([-2, -1, 0, 1, 2, 3]).int()
+    info.atom_types = priors["atoms_prior"]
+    info.edge_types = priors["bonds_prior"]
+    info.charges_marginals = priors["charges_prior"]
+    info.input_dims = SimpleNamespace(X=16, C=6, E=5, y=1, pos=3)
+    info.output_dims = SimpleNamespace(X=16, C=6, E=5, y=0, pos=3)
+    # This value is unused without a latent node-count predictor (rejected above).
+    info.max_n_nodes = 0
+    return info
+
+
+def analyze_without_dataset(molecule_list, calculate_statistics=True,
+                            filter_by_posebusters=False, filter_by_lipinski=False,
+                            **kwargs):
+    """Check chemical validity/uniqueness without reporting novelty or dataset distances."""
+    from rdkit.Chem import Descriptors, QED
+    from experiments.sampling.analyze import sascorer
+    from experiments.sampling.lipinski import lipinski_pass
+
+    if filter_by_posebusters:
+        raise ValueError("Dataset-free mode supports PoseBusters evaluation via the normal output stage, not --filter-by-posebusters")
+    valid, smiles, seen = [], [], set()
+    chemically_valid = 0
+    for molecule in molecule_list:
+        if molecule.rdkit_mol is None:
+            continue
+        try:
+            mol = molecule.rdkit_mol
+            Chem.SanitizeMol(mol)
+            if len(Chem.GetMolFrags(mol)) != 1:
+                continue
+            smi = Chem.MolToSmiles(mol)
+            chemically_valid += 1
+            if filter_by_lipinski and not lipinski_pass(mol):
+                continue
+            if smi in seen:
+                continue
+            seen.add(smi)
+            valid.append(molecule)
+            smiles.append(smi)
+        except (ValueError, RuntimeError):
+            continue
+    if not calculate_statistics:
+        return valid
+    metrics = {
+        "validity": chemically_valid / max(len(molecule_list), 1),
+        "uniqueness": len(valid) / max(chemically_valid, 1),
+    }
+    # These descriptors depend only on generated molecules, not on training data.
+    statistics = {
+        "QEDs": [QED.qed(m.rdkit_mol) for m in valid],
+        "SAs": [round((10 - sascorer.calculateScore(m.rdkit_mol)) / 9, 2) for m in valid],
+        "MolWeights": [Descriptors.MolWt(m.rdkit_mol) for m in valid],
+        "Num_Atoms": [m.rdkit_mol.GetNumAtoms() for m in valid],
+    }
+    return {}, metrics, statistics, smiles, [], valid
 
 
 def load_or_create_sampling_metadata(metadata_file, config, build_metadata):
@@ -154,7 +263,8 @@ def ensure_pocket_txt(pdb_file, sdf_file, txt_file, cutoff):
 
 def evaluate(args):
     # load hyperparameter
-    hparams = torch.load(args.model_path)["hyper_parameters"]
+    checkpoint = torch.load(args.model_path, map_location="cpu")
+    hparams = dict(checkpoint["hyper_parameters"])
     hparams["select_train_subset"] = False
     hparams["diffusion_pretraining"] = False
     hparams["num_charge_classes"] = 6
@@ -167,104 +277,123 @@ def evaluate(args):
     hparams.load_ckpt = None
     hparams.gpus = 1
 
-    print(f"Loading {hparams.dataset} Datamodule.")
-    if hparams.dataset == "crossdocked":
-        dataset = "crossdocked"
-        if hparams.use_adaptive_loader:
-            print(f"Using non-adaptive dataloader for {dataset}")
-            from experiments.data.ligand.ligand_dataset_adaptive import (
-                LigandPocketDataModule as DataModule,
-            )
-        else:
-            print("Using non-adaptive dataloader")
-            from experiments.data.ligand.ligand_dataset_nonadaptive import (
-                LigandPocketDataModule as DataModule,
-            )
-    elif hparams.dataset == "kiba":
-        dataset = "kiba"
-        if hparams.use_adaptive_loader:
-            print(f"Using non-adaptive dataloader for {dataset}")
-            from experiments.data.ligand.ligand_dataset_adaptive import (
-                LigandPocketDataModule as DataModule,
-            )
-        else:
-            print("Using non-adaptive dataloader")
-            from experiments.data.ligand.ligand_dataset_nonadaptive import (
-                LigandPocketDataModule as DataModule,
-            )
-    elif hparams.dataset == "kinodata":
+    if args.dataset_free:
+        if args.metadata_only:
+            raise ValueError("--metadata-only requires the original dataset; omit it with --dataset-free")
+        if args.encode_ligands or args.inpainting or args.filter_by_posebusters:
+            raise ValueError("--dataset-free does not support ligand encoding, inpainting, or PoseBusters filtering")
         dataset = hparams.dataset
-        print(f"Using non-adaptive dataloader for {dataset}")
-        from experiments.data.ligand.kino_dataset_nonadaptive import (
-            LigandPocketDataModule as DataModule,
-        )
-    elif hparams.dataset == "pdbbind":
-        dataset = "pdbbind"
-        if hparams.use_adaptive_loader:
-            print(f"Using non-adaptive dataloader for {dataset}")
-            from experiments.data.ligand.ligand_dataset_adaptive import (
-                LigandPocketDataModule as DataModule,
-            )
-        else:
-            print("Using non-adaptive dataloader")
-            from experiments.data.ligand.ligand_dataset_nonadaptive import (
-                LigandPocketDataModule as DataModule,
-            )
+        dataset_info = checkpoint_dataset_info(checkpoint, hparams)
+        # Trainer initializes a conditional distribution unconditionally. This
+        # constructor placeholder is never sampled and is replaced immediately.
+        histogram = [[1.0]]
+        test_smiles = []
+        prop_norm = prop_dist = None
+        args.fix_n_nodes = True
+        args.prior_n_atoms = "conditional"
+        analyze_molecules = analyze_without_dataset
+        print("Dataset-free sampling: recovered checkpoint priors; using reference "
+              "ligand atom counts. Training novelty/distribution metrics are omitted.")
     else:
-        raise Exception("Dataset not available!")
-
-    metadata_file = args.metadata_file
-    if metadata_file is None:
-        metadata_file = Path(hparams.dataset_root) / "sampling_metadata.pickle"
-    metadata_config = {
-        key: hparams.get(key)
-        for key in (
-            "dataset", "remove_hs", "num_bond_classes", "num_charge_classes",
-            "properties_list", "context_mapping", "use_centroid_context_embed",
-            "property_training", "regression_property", "joint_property_prediction",
-            "additional_feats",
-        )
-    }
-
-    def build_metadata():
-        datamodule = DataModule(hparams)
-
-        from experiments.data.data_info import GeneralInfos as DataInfos
-
-        dataset_info = DataInfos(datamodule, hparams)
-        histogram = os.path.join(hparams.dataset_root, "size_distribution.npy")
-        histogram = np.load(histogram).tolist()
-        test_smiles = list(datamodule.test_dataset.smiles)
-
-        prop_norm, prop_dist = None, None
-        if (
-            len(hparams.properties_list) > 0
-            and hparams.context_mapping
-            and not hparams.use_centroid_context_embed
-        ) or (
-            hparams.property_training
-            and not (
-                hparams.regression_property == "sa_score"
-                or hparams.regression_property == "docking_score"
-                or hparams.regression_property == "ic50"
+        print(f"Loading {hparams.dataset} Datamodule.")
+        if hparams.dataset == "crossdocked":
+            dataset = "crossdocked"
+            if hparams.use_adaptive_loader:
+                print(f"Using non-adaptive dataloader for {dataset}")
+                from experiments.data.ligand.ligand_dataset_adaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+            else:
+                print("Using non-adaptive dataloader")
+                from experiments.data.ligand.ligand_dataset_nonadaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+        elif hparams.dataset == "kiba":
+            dataset = "kiba"
+            if hparams.use_adaptive_loader:
+                print(f"Using non-adaptive dataloader for {dataset}")
+                from experiments.data.ligand.ligand_dataset_adaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+            else:
+                print("Using non-adaptive dataloader")
+                from experiments.data.ligand.ligand_dataset_nonadaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+        elif hparams.dataset == "kinodata":
+            dataset = hparams.dataset
+            print(f"Using non-adaptive dataloader for {dataset}")
+            from experiments.data.ligand.kino_dataset_nonadaptive import (
+                LigandPocketDataModule as DataModule,
             )
-        ):
-            prop_norm = datamodule.compute_mean_mad(hparams.properties_list)
-            prop_dist = DistributionProperty(datamodule, hparams.properties_list)
-            prop_dist.set_normalizer(prop_norm)
-        return dict(dataset_info=dataset_info, histogram=histogram,
-                    test_smiles=test_smiles, prop_norm=prop_norm, prop_dist=prop_dist)
+        elif hparams.dataset == "pdbbind":
+            dataset = "pdbbind"
+            if hparams.use_adaptive_loader:
+                print(f"Using non-adaptive dataloader for {dataset}")
+                from experiments.data.ligand.ligand_dataset_adaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+            else:
+                print("Using non-adaptive dataloader")
+                from experiments.data.ligand.ligand_dataset_nonadaptive import (
+                    LigandPocketDataModule as DataModule,
+                )
+        else:
+            raise Exception("Dataset not available!")
 
-    metadata = load_or_create_sampling_metadata(
-        metadata_file, metadata_config, build_metadata
-    )
-    if args.metadata_only:
-        return
-    dataset_info = metadata["dataset_info"]
-    histogram = metadata["histogram"]
-    test_smiles = metadata["test_smiles"]
-    prop_norm = metadata["prop_norm"]
-    prop_dist = metadata["prop_dist"]
+        metadata_file = args.metadata_file
+        if metadata_file is None:
+            metadata_file = Path(hparams.dataset_root) / "sampling_metadata.pickle"
+        metadata_config = {
+            key: hparams.get(key)
+            for key in (
+                "dataset", "remove_hs", "num_bond_classes", "num_charge_classes",
+                "properties_list", "context_mapping", "use_centroid_context_embed",
+                "property_training", "regression_property", "joint_property_prediction",
+                "additional_feats",
+            )
+        }
+
+        def build_metadata():
+            datamodule = DataModule(hparams)
+
+            from experiments.data.data_info import GeneralInfos as DataInfos
+
+            dataset_info = DataInfos(datamodule, hparams)
+            histogram = os.path.join(hparams.dataset_root, "size_distribution.npy")
+            histogram = np.load(histogram).tolist()
+            test_smiles = list(datamodule.test_dataset.smiles)
+
+            prop_norm, prop_dist = None, None
+            if (
+                len(hparams.properties_list) > 0
+                and hparams.context_mapping
+                and not hparams.use_centroid_context_embed
+            ) or (
+                hparams.property_training
+                and not (
+                    hparams.regression_property == "sa_score"
+                    or hparams.regression_property == "docking_score"
+                    or hparams.regression_property == "ic50"
+                )
+            ):
+                prop_norm = datamodule.compute_mean_mad(hparams.properties_list)
+                prop_dist = DistributionProperty(datamodule, hparams.properties_list)
+                prop_dist.set_normalizer(prop_norm)
+            return dict(dataset_info=dataset_info, histogram=histogram,
+                        test_smiles=test_smiles, prop_norm=prop_norm, prop_dist=prop_dist)
+
+        metadata = load_or_create_sampling_metadata(
+            metadata_file, metadata_config, build_metadata
+        )
+        if args.metadata_only:
+            return
+        dataset_info = metadata["dataset_info"]
+        histogram = metadata["histogram"]
+        test_smiles = metadata["test_smiles"]
+        prop_norm = metadata["prop_norm"]
+        prop_dist = metadata["prop_dist"]
+        analyze_molecules = analyze_stability_for_molecules
 
     if hparams.additional_feats:
         from experiments.deprecated.diffusion_discrete_pocket_addfeats import Trainer
@@ -286,22 +415,31 @@ def evaluate(args):
         hparams.flow_matching = False
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Trainer.load_from_checkpoint(
-        args.model_path,
-        dataset_info=dataset_info,
-        smiles_list=test_smiles,
-        histogram=histogram,
-        prop_norm=prop_norm,
-        prop_dist=prop_dist,
-        load_ckpt_from_pretrained=None,
-        use_centroid_context_embed=hparams.use_centroid_context_embed,
-        use_latent_encoder=hparams.use_latent_encoder,
-        use_scaffold_latent_embed=hparams.use_scaffold_latent_embed,
-        flow_matching=hparams.flow_matching,
-        load_ckpt=None,
-        run_evaluation=True,
-        strict=False,
-    ).to(device)
+    if args.dataset_free:
+        model = Trainer(hparams=dict(hparams), dataset_info=dataset_info,
+                        smiles_list=[], histogram=histogram,
+                        prop_norm=None, prop_dist=None)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        model.conditional_size_distribution = UnavailableSizeDistribution()
+        model = model.to(device)
+    else:
+        model = Trainer.load_from_checkpoint(
+            args.model_path,
+            dataset_info=dataset_info,
+            smiles_list=test_smiles,
+            histogram=histogram,
+            prop_norm=prop_norm,
+            prop_dist=prop_dist,
+            load_ckpt_from_pretrained=None,
+            use_centroid_context_embed=hparams.use_centroid_context_embed,
+            use_latent_encoder=hparams.use_latent_encoder,
+            use_scaffold_latent_embed=hparams.use_scaffold_latent_embed,
+            flow_matching=hparams.flow_matching,
+            load_ckpt=None,
+            run_evaluation=True,
+            strict=False,
+        ).to(device)
+    del checkpoint
 
     model.eval()
 
@@ -355,6 +493,10 @@ def evaluate(args):
             pdb_file = Path(sdf_file.parent, f"{pdb_name}_pocket.pdb")
         else:
             pdb_file = Path(sdf_file.parent, f"{pdb_name}.pdb")
+        if not pdb_file.exists():
+            protein_file = Path(sdf_file.parent, f"{pdb_name}_protein.pdb")
+            if protein_file.exists():
+                pdb_file = protein_file
 
         txt_file = Path(sdf_file.parent, f"{ligand_name}.txt")
         ensure_pocket_txt(pdb_file, sdf_file, txt_file, args.pocket_cutoff)
@@ -417,7 +559,7 @@ def evaluate(args):
 
             all_molecules += len(molecules)
             tmp_molecules.extend(molecules)
-            valid_molecules = analyze_stability_for_molecules(
+            valid_molecules = analyze_molecules(
                 molecule_list=tmp_molecules,
                 dataset_info=dataset_info,
                 smiles_train=test_smiles,
@@ -459,7 +601,7 @@ def evaluate(args):
 
                 all_molecules += len(molecules)
                 tmp_molecules.extend(molecules)
-                valid_molecules = analyze_stability_for_molecules(
+                valid_molecules = analyze_molecules(
                     molecule_list=tmp_molecules,
                     dataset_info=dataset_info,
                     smiles_train=test_smiles,
@@ -534,7 +676,7 @@ def evaluate(args):
             _,
             _,
             valid_molecules,
-        ) = analyze_stability_for_molecules(
+        ) = analyze_molecules(
             molecule_list=valid_and_unique_molecules,
             dataset_info=dataset_info,
             smiles_train=test_smiles,
@@ -606,7 +748,7 @@ def evaluate(args):
             with torch.no_grad():
                 ligand_embeds = model.encode_ligand(ligand_data)
             embedding_dict[ligand_name]["sampled"].append(ligand_embeds)
-        if "ic50" in hparams.regression_property:
+        if "ic50" in (hparams.regression_property or ""):
             # split into n chunks to avoid OOM error
             n = 4 if len(valid_molecules) > 80 else 3
             molecules_list = list(chunks(valid_molecules, n))
@@ -719,7 +861,7 @@ def evaluate(args):
 
     times_arr = torch.tensor([x for x in time_per_pocket.values()])
     print(
-        f"Time per pocket: {times_arr.mean():.3f} \pm "
+        f"Time per pocket: {times_arr.mean():.3f} ± "
         f"{times_arr.std(unbiased=False):.2f}"
     )
     print("Sampling finished.")
@@ -765,6 +907,8 @@ def get_args():
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--metadata-file", type=Path, default=None,
                         help="Portable sampling metadata pickle. Loaded if present; otherwise created from --dataset-root. Defaults to DATASET_ROOT/sampling_metadata.pickle.")
+    parser.add_argument("--dataset-free", action="store_true",
+                        help="Sample CrossDocked models using checkpoint priors and reference ligand sizes, without training data or metadata. Omits training-reference metrics.")
     parser.add_argument("--metadata-only", action="store_true",
                         help="Create or validate sampling metadata and exit before loading the model or sampling.")
     parser.add_argument('--dataset-root', default=None, type=str,
