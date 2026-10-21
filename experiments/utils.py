@@ -1570,7 +1570,7 @@ def prepare_pocket(
                     np.eye(
                         1,
                         len(amino_acid_dict),
-                        amino_acid_dict[three_to_one.get(res.get_resname())],
+                        amino_acid_dict[three_to_one.get(res.get_resname().strip().title())],
                     ).squeeze()
                 )
                 m = True
@@ -1625,7 +1625,7 @@ def get_res_coords(residues):
                     np.eye(
                         1,
                         len(amino_acid_dict),
-                        amino_acid_dict[three_to_one.get(res.get_resname())],
+                        amino_acid_dict[three_to_one.get(res.get_resname().strip().title())],
                     ).squeeze()
                 )
                 m = True
