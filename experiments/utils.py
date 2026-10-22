@@ -2127,3 +2127,15 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         self.last_epoch = math.floor(epoch)
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group["lr"] = lr
+
+def clear_xtb():
+    import pathlib
+    import subprocess
+    import sys
+
+    for library in pathlib.Path(sys.prefix).rglob("libmctc-lib-*.so*"):
+        if library.is_file():
+            subprocess.run(
+                ["patchelf", "--clear-execstack", str(library)],
+                check=True,
+            )

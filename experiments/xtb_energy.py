@@ -1,8 +1,8 @@
 from ase import Atoms
-from xtb.ase.calculator import XTB
+
 import argparse
 import numpy as np
-
+from experiments.utils import clear_xtb
 
 def get_args():
     # fmt: off
@@ -15,6 +15,8 @@ def get_args():
 
 
 def calculate_xtb_energy(positions, atom_types):
+    clear_xtb()
+    from xtb.ase.calculator import XTB
     atoms = Atoms(positions=positions, symbols=atom_types)
     atoms.calc = XTB(method="GFN2-xTB")
     pot_e = atoms.get_potential_energy()
