@@ -32,6 +32,7 @@ dependencies:
   - mkl=2024.0
 
   - mx::reduce
+  - patchelf
   - conda-forge::biopython=1.81
   - pip:
       - ase
