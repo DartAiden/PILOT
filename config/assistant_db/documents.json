@@ -1,0 +1,28 @@
+{
+  "pilot_inputs": {
+    "id": "pilot_inputs",
+    "title": "PILOT Input Files and Sampling Configuration",
+    "content": "<data_description>PILOT generates 3D candidate ligands conditioned on a protein binding pocket using its included CrossDocked checkpoint. Inference uses checkpoint-derived priors and the reference ligand atom count, and does not require the training dataset. The protein PDB and reference-ligand SDF must use the same coordinate frame.</data_description>\n\n<input_files>\n[.pdb, .sdf, .json]\n</input_files>\n\n<input_schema>\n{\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"properties\": {\n    \"num_samples\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 100, \"default\": 10},\n    \"batch_size\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 40, \"default\": 10},\n    \"max_sample_iter\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 50, \"default\": 20},\n    \"pocket_cutoff\": {\"type\": \"number\", \"exclusiveMinimum\": 0, \"maximum\": 12, \"default\": 7.0},\n    \"filter_by_lipinski\": {\"type\": \"boolean\", \"default\": false}\n  }\n}\n</input_schema>\n\nProvide exactly one protein PDB and one reference-ligand SDF whose coordinates share a frame, and at most one optional JSON configuration. If no pocket residue list is supplied, the service selects standard protein residues within `pocket_cutoff` angstroms of the reference ligand. Output structures are candidate molecules; the summary does not report affinity, docking scores, or experimental results.",
+    "source": "",
+    "mode": "pilot",
+    "metadata": {
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "parent_doc_id": "pilot_inputs",
+      "is_chunked": false
+    }
+  },
+  "pilot_paper": {
+    "id": "pilot_paper",
+    "title": "PILOT Research Paper",
+    "content": "<data_description>PILOT is an equivariant diffusion approach for pocket-conditioned de novo ligand generation with multi-objective guidance via importance sampling. This serving configuration exposes ligand sampling using the included CrossDocked checkpoint and does not calculate binding affinity or docking scores.</data_description>",
+    "source": "https://doi.org/10.1039/D4SC03523B",
+    "mode": "pilot",
+    "metadata": {
+      "chunk_index": 0,
+      "total_chunks": 1,
+      "parent_doc_id": "pilot_paper",
+      "is_chunked": false
+    }
+  }
+}

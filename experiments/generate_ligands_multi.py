@@ -609,6 +609,7 @@ def evaluate(args):
                     return_molecules=True,
                     calculate_statistics=False,
                     calculate_distribution_statistics=False,
+                    filter_by_lipinski=args.filter_by_lipinski,
                     pdb_file=pdb_file,
                     remove_hs=hparams.remove_hs,
                     device="cpu",
@@ -897,7 +898,7 @@ def evaluate(args):
         json.dump(argsdicts, f)
 
 
-def get_args():
+def get_args(argv=None):
     # fmt: off
     parser = argparse.ArgumentParser(description='Data generation')
     parser.add_argument('--mp-index', default=0, type=int)
@@ -1004,7 +1005,7 @@ def get_args():
     parser.add_argument("--keep-ids",  default=None, nargs="+", type=int)
     parser.add_argument("--emd-ot",  default=False, action="store_true")
     parser.add_argument("--importance-gradient-guidance",  default=False, action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args
 
 
