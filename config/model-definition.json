@@ -1,0 +1,81 @@
+{
+  "title": "PILOT",
+  "name": "PILOT",
+  "short_description": "Generates 3D ligand candidates conditioned on a protein and reference ligand.",
+  "description": "PILOT is an equivariant diffusion model for pocket-conditioned de novo ligand generation. This service runs its upstream dataset-free sampling path with the included CrossDocked checkpoint, a single protein PDB, and a reference-ligand SDF in the same coordinate frame.",
+  "processors": {
+    "input": "",
+    "output": ""
+  },
+  "projects": [
+    "staging",
+    "production"
+  ],
+  "reference_links": [
+    "https://doi.org/10.1039/D4SC03523B"
+  ],
+  "integrated_software": {
+    "PILOT": {
+      "original_source": "https://doi.org/10.1039/D4SC03523B",
+      "latest_version": "included-submodule-checkpoint",
+      "release_date": "",
+      "qbio_hosted_version": "0.1",
+      "license": "MIT"
+    }
+  },
+  "dataset_info": "The included last.pt checkpoint is trained on CrossDocked. Dataset-free inference recovers model priors from the checkpoint and uses the reference ligand atom count; training data is not required.",
+  "observations": "Provide one protein PDB and one reference-ligand SDF whose coordinates share the same frame. PILOT selects pocket residues within the configured cutoff of the reference ligand. Generated molecules are candidates and are not experimentally validated; no affinity or docking score is produced.",
+  "input_data": "Exactly one protein PDB and one reference-ligand SDF, plus an optional JSON sampling configuration.",
+  "output_data": "A ZIP archive containing generated ligand structures and a JSON summary; the summary is also returned separately.",
+  "features": "Samples candidate ligand structures using the included PILOT CrossDocked checkpoint. Sample count, batch size, sampling iterations, pocket cutoff, and Lipinski filtering are configurable.",
+  "strengths": "Generates 3D ligand candidates conditioned on protein pocket structure using an equivariant diffusion model and checkpoint-derived priors.",
+  "weaknesses": "Requires a reference ligand with coordinates in the same frame as the protein. Generated candidates are not affinity predictions or experimentally validated compounds; GPU resources are recommended.",
+  "model_queue_name": "kserve-PILOT",
+  "assistant": {
+    "id": "",
+    "assistant_model": "glm-4.7-fp8",
+    "version": "0.1",
+    "assistant_name": "PILOT - Assistant",
+    "description": "This is an LLM based PILOT expert."
+  },
+  "nodes": [
+    {
+      "id": "input",
+      "name": "Protein PDB, reference-ligand SDF, and optional sampling config",
+      "type": "input_file",
+      "step": "external:model/predict:inference_response"
+    },
+    {
+      "id": "predict",
+      "name": "PILOT",
+      "type": "compute",
+      "step": "external:model/predict:inference_response",
+      "estimated_resources": {
+        "cpu": 8,
+        "memory": 16384,
+        "gpu": 1,
+        "gpu_type": "NVIDIA L4",
+        "compute_seconds": 3600
+      }
+    },
+    {
+      "id": "output",
+      "name": "Generated ligand candidates",
+      "type": "output_file",
+      "step": "external:model/predict:inference_response",
+      "payload": {
+        "mime": "application/zip"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "input",
+      "target": "predict"
+    },
+    {
+      "source": "predict",
+      "target": "output"
+    }
+  ]
+}

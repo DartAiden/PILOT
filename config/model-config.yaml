@@ -1,0 +1,4 @@
+minWorkers: 1
+maxWorkers: 1
+handler:
+  model_name: "experiments.diffusion_discrete_pocket.Trainer"
